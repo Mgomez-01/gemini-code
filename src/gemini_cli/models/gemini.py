@@ -10,6 +10,9 @@ import time
 from rich.console import Console
 from rich.panel import Panel
 import questionary
+import json
+import os
+from pathlib import Path
 
 # Import exceptions for specific error handling if needed later
 from google.api_core.exceptions import ResourceExhausted
@@ -25,7 +28,120 @@ MAX_AGENT_ITERATIONS = 10
 FALLBACK_MODEL = "gemini-1.5-pro-latest"
 CONTEXT_TRUNCATION_THRESHOLD_TOKENS = 800000 # Example token limit
 
-def list_available_models(api_key):
+# Task capability mapping - which models support which capabilities
+MODEL_CAPABILITIES = {
+    # Default capabilities for all Gemini models
+    "default": ["code_generation", "code_understanding"],
+    # Model-specific capabilities
+    "gemini-1.5-pro": ["code_generation", "code_understanding", "file_editing", "system_commands", "all_tools"],
+    "gemini-1.0-pro": ["code_generation", "code_understanding", "limited_file_editing"],
+    "gemini-ultra": ["code_generation", "code_understanding", "file_editing", "system_commands", "all_tools", "advanced_tasks"],
+    "gemini-1.5-flash": ["code_generation", "code_understanding", "limited_file_editing"],
+    "gemini-2.5-pro-exp-03-25": ["code_generation", "code_understanding", "file_editing", "system_commands", "all_tools", "advanced_tasks"]
+}
+
+# Task capability symbols mapping
+CAPABILITY_SYMBOLS = {
+    "code_generation": "🔧 Code Gen",
+    "code_understanding": "📘 Code Understand",
+    "file_editing": "📁 File Edit",
+    "limited_file_editing": "❌ Limited File Edit",
+    "system_commands": "💻 System Cmds",
+    "all_tools": "🔨 All Tools",
+    "advanced_tasks": "🚀 Advanced Tasks"
+}
+
+def get_capabilities_cache_path():
+    """
+    Returns the path to the capabilities cache file.
+    Creates the directory if it doesn't exist.
+    
+    Returns:
+        Path: Path to the capabilities cache file
+    """
+    # Get the user's home directory
+    home_dir = Path.home()
+    cache_dir = home_dir / ".gemini-code"
+    
+    # Create the directory if it doesn't exist
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    return cache_dir / "capabilities-cache.json"
+
+def load_capabilities_cache():
+    """
+    Loads the capabilities cache from disk.
+    
+    Returns:
+        dict: Cached capabilities data or empty dict if no cache
+    """
+    try:
+        cache_path = get_capabilities_cache_path()
+        if cache_path.exists():
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"Error loading capabilities cache: {e}")
+    
+    return {}
+
+def save_capabilities_cache(cache_data):
+    """
+    Saves the capabilities cache to disk.
+    
+    Args:
+        cache_data (dict): Capabilities data to cache
+    """
+    try:
+        cache_path = get_capabilities_cache_path()
+        with open(cache_path, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+        log.info(f"Saved capabilities cache to {cache_path}")
+    except Exception as e:
+        log.warning(f"Error saving capabilities cache: {e}")
+
+def detect_model_capabilities(model_name, use_cache=True):
+    """
+    Detects capabilities for a specific model based on predefined mappings.
+    Uses cached capabilities if available and requested.
+    
+    Args:
+        model_name (str): The name of the model to check
+        use_cache (bool): Whether to use cached capabilities
+        
+    Returns:
+        list: List of capability strings
+    """
+    # Check cache first if requested
+    if use_cache:
+        cache = load_capabilities_cache()
+        if model_name in cache:
+            log.info(f"Using cached capabilities for model: {model_name}")
+            return cache[model_name]
+    
+    # Extract base model name (remove version suffixes for matching)
+    base_model = None
+    for model_key in MODEL_CAPABILITIES.keys():
+        if model_key != "default" and model_key in model_name:
+            base_model = model_key
+            break
+    
+    # Use specific model capabilities if found, otherwise use default
+    if base_model and base_model in MODEL_CAPABILITIES:
+        capabilities = MODEL_CAPABILITIES[base_model]
+    else:
+        capabilities = MODEL_CAPABILITIES["default"]
+        log.info(f"Using default capabilities for unknown model: {model_name}")
+    
+    # Cache the result if caching is enabled
+    if use_cache:
+        cache = load_capabilities_cache()
+        cache[model_name] = capabilities
+        save_capabilities_cache(cache)
+    
+    return capabilities
+
+def list_available_models(api_key, detect_capabilities=True):
     try:
         genai.configure(api_key=api_key)
         models = genai.list_models()
@@ -33,8 +149,21 @@ def list_available_models(api_key):
         for model in models:
             # Filter for models supporting generateContent to avoid chat-only models if needed
             if 'generateContent' in model.supported_generation_methods:
-                 model_info = { "name": model.name, "display_name": model.display_name, "description": model.description, "supported_generation_methods": model.supported_generation_methods }
-                 gemini_models.append(model_info)
+                model_info = { 
+                    "name": model.name, 
+                    "display_name": model.display_name, 
+                    "description": model.description, 
+                    "supported_generation_methods": model.supported_generation_methods 
+                }
+                
+                # Add capabilities information if requested
+                if detect_capabilities:
+                    capabilities = detect_model_capabilities(model.name)
+                    model_info["capabilities"] = capabilities
+                    # Add symbols for easier display
+                    model_info["capability_symbols"] = [CAPABILITY_SYMBOLS.get(cap, cap) for cap in capabilities]
+                
+                gemini_models.append(model_info)
         return gemini_models
     except Exception as e:
         log.error(f"Error listing models: {str(e)}")
@@ -95,8 +224,63 @@ class GeminiModel:
             log.error(f"Failed to create model instance for '{self.current_model_name}': {init_err}", exc_info=True)
             raise init_err
 
-    def get_available_models(self):
-        return list_available_models(self.api_key)
+    def get_available_models(self, detect_capabilities=True):
+        return list_available_models(self.api_key, detect_capabilities=detect_capabilities)
+        
+    def test_model_capabilities(self, force_test=False):
+        """
+        Tests the current model against a predefined set of tasks to determine capabilities.
+        Uses cache unless force_test is True.
+        
+        Args:
+            force_test (bool): Whether to force testing even if there's cached data
+        
+        Returns:
+            list: List of detected capabilities
+        """
+        log.info(f"Testing capabilities for model: {self.current_model_name}")
+        
+        # Check cache first if not forcing a test
+        if not force_test:
+            cache = load_capabilities_cache()
+            if self.current_model_name in cache:
+                log.info(f"Using cached capabilities for {self.current_model_name}")
+                return cache[self.current_model_name]
+        
+        capabilities = []
+        
+        # Sample small tests for each capability
+        # In a real implementation, these would be actual API calls to test:
+        # 1. Try a small code generation task
+        # 2. Try a file edit operation
+        # 3. Try a system command execution
+        # etc.
+        
+        try:
+            # For now, we're using the predefined capability mapping
+            capabilities = detect_model_capabilities(self.current_model_name, use_cache=False)
+            log.info(f"Detected capabilities for {self.current_model_name}: {capabilities}")
+            
+            # Here we would run actual tests to determine capabilities
+            # For example:
+            #
+            # For code generation:
+            # test_prompt = "Write a Python function that calculates factorial."
+            # response = self.model.generate_content(test_prompt)
+            # if valid Python code in response: capabilities.append("code_generation")
+            #
+            # For file_editing: try a minimal edit operation, etc.
+            
+            # Cache the results
+            cache = load_capabilities_cache()
+            cache[self.current_model_name] = capabilities
+            save_capabilities_cache(cache)
+            
+            return capabilities
+        except Exception as e:
+            log.error(f"Error testing model capabilities: {str(e)}")
+            # Fall back to mappings, but don't cache the fallback
+            return detect_model_capabilities(self.current_model_name, use_cache=False)
 
     # --- Native Function Calling Agent Loop ---
     def generate(self, prompt: str) -> str | None:

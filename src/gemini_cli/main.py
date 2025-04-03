@@ -107,19 +107,112 @@ def set_default_model(model_name):
     except Exception as e: console.print(f"[bold red]Error setting default model:[/bold red] {e}")
 
 @cli.command()
-def list_models():
+@click.option('--detailed', '-d', is_flag=True, help='Show detailed capability information')
+def list_models(detailed):
+    """List available models with their capabilities."""
+    
     if not config: console.print("[bold red]Config error.[/bold red]"); return
     api_key = config.get_api_key("google")
     if not api_key: console.print("[bold red]Error:[/bold red] API key not found. Run 'gemini setup'."); return
     console.print("[yellow]Fetching models...[/yellow]")
     try:
-        models_list = list_available_models(api_key)
+        models_list = list_available_models(api_key, detect_capabilities=True)
         if not models_list or (isinstance(models_list, list) and len(models_list) > 0 and isinstance(models_list[0], dict) and "error" in models_list[0]):
              console.print(f"[red]Error listing models:[/red] {models_list[0].get('error', 'Unknown error') if models_list else 'No models found or fetch error.'}"); return
+        
         console.print("\n[bold cyan]Available Models (Access may vary):[/bold cyan]")
-        for model_data in models_list: console.print(f"- [bold green]{model_data['name']}[/bold green] (Display: {model_data.get('display_name', 'N/A')})")
+        
+        # Define capability symbols legend
+        if detailed:
+            from .models.gemini import CAPABILITY_SYMBOLS
+            legend = "\n[bold]Capability Legend:[/bold]\n"
+            for cap, symbol in CAPABILITY_SYMBOLS.items():
+                legend += f"  {symbol}: {cap.replace('_', ' ').title()}\n"
+            console.print(legend)
+        
+        for model_data in models_list:
+            # Basic model info
+            model_info = f"- [bold green]{model_data['name']}[/bold green]"
+            
+            # Add capability symbols if available
+            if "capability_symbols" in model_data and model_data["capability_symbols"]:
+                symbols = " ".join([f"[{get_capability_color(cap)}]{cap}[/{get_capability_color(cap)}]" 
+                                   for cap in model_data["capability_symbols"]])
+                model_info += f" {symbols}"
+            
+            # Add display name
+            model_info += f" (Display: {model_data.get('display_name', 'N/A')})"
+            
+            console.print(model_info)
+            
+            # Add detailed capabilities if requested
+            if detailed and "capabilities" in model_data:
+                capabilities_text = "  Capabilities: " + ", ".join([cap.replace("_", " ").title() for cap in model_data["capabilities"]])
+                console.print(f"  [dim]{capabilities_text}[/dim]")
+                if "description" in model_data and model_data["description"]:
+                    desc_text = model_data["description"]
+                    # Truncate long descriptions
+                    if len(desc_text) > 100:
+                        desc_text = desc_text[:97] + "..."
+                    console.print(f"  [dim]Description: {desc_text}[/dim]")
+                console.print("")
+        
         console.print("\nUse 'gemini --model MODEL' or 'gemini set-default-model MODEL'.")
+        console.print("Use 'gemini list-models --detailed' to see full capability information.")
     except Exception as e: console.print(f"[bold red]Error listing models:[/bold red] {e}"); log.error("List models failed", exc_info=True)
+
+
+def get_capability_color(capability):
+    """Returns an appropriate color based on capability type."""
+    if "❌" in capability:
+        return "red"
+    elif "Code" in capability:
+        return "green"
+    elif "File" in capability:
+        return "blue"
+    elif "System" in capability:
+        return "magenta"
+    elif "Advanced" in capability or "🚀" in capability:
+        return "yellow"
+    else:
+        return "cyan"
+
+
+@cli.command()
+@click.argument('model_name', required=True)
+def test_capabilities(model_name):
+    """Force test and update capabilities for a specific model."""
+    if not config: console.print("[bold red]Config error.[/bold red]"); return
+    api_key = config.get_api_key("google")
+    if not api_key: console.print("[bold red]Error:[/bold red] API key not found. Run 'gemini setup'."); return
+    
+    console.print(f"[yellow]Testing capabilities for model: {model_name}...[/yellow]")
+    
+    try:
+        # Initialize model with the specified name
+        from .models.gemini import GeminiModel
+        model = GeminiModel(api_key=api_key, console=console, model_name=model_name)
+        
+        # Force test capabilities
+        with console.status(f"[yellow]Testing model capabilities...[/yellow]", spinner="dots"):
+            capabilities = model.test_model_capabilities(force_test=True)
+        
+        # Display results
+        console.print("\n[bold green]Capability test completed![/bold green]")
+        console.print(f"[bold]Model:[/bold] {model_name}")
+        console.print("[bold]Capabilities:[/bold]")
+        
+        from .models.gemini import CAPABILITY_SYMBOLS
+        for capability in capabilities:
+            symbol = CAPABILITY_SYMBOLS.get(capability, capability)
+            color = get_capability_color(symbol)
+            console.print(f"  [{color}]{symbol}[/{color}] ({capability.replace('_', ' ').title()})")
+        
+        console.print("\nCapabilities have been tested and cached for future use.")
+        
+    except Exception as e:
+        console.print(f"[bold red]Error testing model capabilities:[/bold red] {e}")
+        log.error(f"Failed to test capabilities for {model_name}", exc_info=True)
 
 
 # --- MODIFIED start_interactive_session to accept and pass console ---
